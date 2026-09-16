@@ -30,11 +30,12 @@ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
 )
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.utils import (
     get_rotation_path,
-    model_uses_sfa_sparse,
     vllm_version_is,
 )
+from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata,
     build_attn_metadata_wrapper,
@@ -50,16 +51,7 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         vllm_config, self.replicated_pcp = prepare_replicated_pcp_config(vllm_config)
         super().__init__(vllm_config, device)
         self.input_batch: InputBatch | None = None
-        draft_config = self.draft_model_config
-        # Compressed MLA and SFA metadata have no dense MLA decode object.
-        uses_compressed_mla = any(
-            hasattr(config, "compress_ratios") for config in (draft_config.hf_config, draft_config.hf_text_config)
-        )
-        self.attn_architecture = (
-            "MLA"
-            if draft_config.use_mla and not uses_compressed_mla and not model_uses_sfa_sparse(draft_config)
-            else None
-        )
+        self.attn_architecture: str | None = None
 
     def load_draft_model(
         self,
@@ -125,6 +117,8 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                     attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
 
             self.attn_backends = attn_backends
+            backend = _get_graph_update_backend(self.attn_groups)
+            self.attn_architecture = "MLA" if issubclass(backend, AscendMLABackend) else None
 
     @contextmanager
     def draft_capture_context(self):
