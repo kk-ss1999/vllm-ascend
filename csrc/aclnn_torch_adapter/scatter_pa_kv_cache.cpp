@@ -21,6 +21,7 @@
 #include <string>
 #include <third_party/op-plugin/op_plugin/utils/op_api_common_base.h>
 #include "torch_npu/csrc/core/npu/NPUFunctions.h"
+#include "torch_npu/csrc/core/npu/NPUFormat.h"
 #include "torch_npu/csrc/framework/OpParamMaker.h"
 
 namespace vllm_ascend {
@@ -116,11 +117,8 @@ void scatter_add_param_to_buf(const at::Tensor& at_tensor) {
     storageDims.push_back(at_tensor.storage().nbytes() / at_tensor.itemsize());
   }
   SCATTER_MEMCPY_TO_BUF(storageDims.data(), static_cast<int64_t>(storageDims.size() * sizeof(int64_t)));
-  aclFormat npu_format_ = ACL_FORMAT_ND;
-  auto* storage_impl = at_tensor.storage().unsafeGetStorageImpl();
-  if (typeid(*storage_impl) == typeid(torch_npu::NPUStorageImpl)) {
-    npu_format_ = torch_npu::NPUBridge::GetNpuStorageImpl(at_tensor)->npu_desc_.npu_format_;
-  }
+  // NPUStorageImpl RTTI is private in PTA; use its exported format query.
+  aclFormat npu_format_ = static_cast<aclFormat>(at_npu::native::get_npu_format(at_tensor));
   SCATTER_MEMCPY_TO_BUF(&npu_format_, sizeof(npu_format_));
 
   addTensorAddrToCachedListFunc(const_cast<void*>(at_tensor.storage().data()));
@@ -513,6 +511,11 @@ bool hit_cache_v2(
   return true;
 }
 
+// PTA's argument-dump logger also uses private NPUStorageImpl RTTI. Keep a
+// lightweight dispatch diagnostic; CANN tiling/cache plog remains unchanged.
+#define SCATTER_EXEC_LOG_WITH_TASK_QUEUE(api, label, queue, stream, ...) \
+    ASCEND_LOGD("VA scatter dispatcher: %s, queue=%s", api, queue)
+
 #define EXEC_NPU_CMD_SCATTER_V1(aclnn_api, ...)                                                                 \
   do {                                                                                                  \
     static const auto getWorkspaceSizeFuncAddr = GetOpApiFuncAddr(#aclnn_api "GetWorkspaceSize");       \
@@ -535,7 +538,7 @@ bool hit_cache_v2(
     if (c10_npu::check_enqueue_need_use(acl_stream)) {                                                  \
       c10_npu::UseStreamResInCurrentThread(acl_stream);                                                 \
     }                                                                                                   \
-    OP_EXEC_LOG_WITH_TASK_QUEUE(#aclnn_api, "EXEC_NPU_CMD", "1", acl_stream, __VA_ARGS__);              \
+    SCATTER_EXEC_LOG_WITH_TASK_QUEUE(#aclnn_api, "EXEC_NPU_CMD", "1", acl_stream, __VA_ARGS__);              \
     uint64_t workspace_size = 0;                                                                        \
     uint64_t* workspace_size_addr = &workspace_size;                                                    \
     aclOpExecutor* executor = nullptr;                                                                  \
@@ -602,7 +605,7 @@ bool hit_cache_v2(
     if (c10_npu::check_enqueue_need_use(acl_stream)) {                                                                \
       c10_npu::UseStreamResInCurrentThread(acl_stream);                                                               \
     }                                                                                                                 \
-    OP_EXEC_LOG_WITH_TASK_QUEUE(#aclnn_api, "EXEC_NPU_CMD", "2", acl_stream, __VA_ARGS__);                            \
+    SCATTER_EXEC_LOG_WITH_TASK_QUEUE(#aclnn_api, "EXEC_NPU_CMD", "2", acl_stream, __VA_ARGS__);                            \
     auto copied_params = CopyTypesV2(__VA_ARGS__);                                                                    \
     uint32_t aic_num = UINT32_MAX;                                                                                    \
     uint32_t aiv_num = UINT32_MAX;                                                                                    \
@@ -694,6 +697,7 @@ void scatter_pa_kv_cache_cached(
                      cache_mode_ptr, scatter_mode_ptr, strides, offsets);
 }
 
+#undef SCATTER_EXEC_LOG_WITH_TASK_QUEUE
 #undef SCATTER_MEMCPY_TO_BUF
 #undef EXEC_NPU_CMD_SCATTER
 #undef EXEC_NPU_CMD_SCATTER_V1
