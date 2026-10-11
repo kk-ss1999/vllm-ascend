@@ -92,7 +92,7 @@ def test_scatter_deterministic_level_transitions(deterministic_level):
     enable_custom_op()
     previous_enabled = torch.are_deterministic_algorithms_enabled()
     previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
-    previous_level = torch_npu.npu.get_deterministic_level()
+    previous_level = torch_npu.npu._get_deterministic_level()
     cache = torch.zeros((2, 2, 128, 4, 128), device="npu", dtype=torch.bfloat16)
     key_cache, value_cache = cache[:, 0], cache[:, 1]
     key = torch.ones((1, 4, 128), device="npu", dtype=torch.bfloat16)
