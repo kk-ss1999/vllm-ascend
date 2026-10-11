@@ -26,6 +26,12 @@
 
 namespace vllm_ascend {
 namespace scatter_dispatch {
+// PTA's rich error macro calls private driver/OOM helpers. Keep fail-fast
+// status checking with the CANN error text for this temporary dispatcher.
+#define SCATTER_NPU_CHECK_ERROR(status, ...) \
+    TORCH_CHECK((status) == ACL_ERROR_NONE, __VA_ARGS__, ": ", aclGetRecentErrMsg())
+
+
 constexpr int g_hash_buf_size = 8192;
 constexpr int g_hash_buf_max_size = g_hash_buf_size + 1024;
 thread_local char g_hash_buf[g_hash_buf_size];
@@ -67,11 +73,11 @@ inline void CheckNpuTensorValid(const at::Tensor& at_tensor) {
       torch_npu::utils::is_npu(at_tensor),
       "Expected all tensors to be on the same device. "
       "Expected NPU tensor, please check whether the input tensor device is correct.",
-      OPS_ERROR(ErrCode::TYPE));
+      " [VA scatter]");
   TORCH_CHECK(
       at_tensor.numel() <= 0 || at_tensor.unsafeGetTensorImpl()->storage_initialized(),
       "The tensor has a non-zero number of elements, but its data is not allocated yet.",
-      OPS_ERROR(ErrCode::VALUE));
+      " [VA scatter]");
 }
 void ScatterMemcpyToBufImpl(const void* data, size_t size) {
   if (g_hash_offset + size > g_hash_buf_size) {
@@ -85,7 +91,7 @@ void ScatterMemcpyToBufImpl(const void* data, size_t size) {
 #define SCATTER_MEMCPY_TO_BUF(data, size) ScatterMemcpyToBufImpl(data, size)
 void scatter_add_param_to_buf(const at::Tensor& at_tensor) {
   static const auto addTensorAddrToCachedListAddr = GetOpApiFuncAddr("AddTensorAddrToCachedList");
-  TORCH_CHECK(addTensorAddrToCachedListAddr != nullptr, "GetOpApiFuncAddr failed.", OPS_ERROR(ErrCode::PTR));
+  TORCH_CHECK(addTensorAddrToCachedListAddr != nullptr, "GetOpApiFuncAddr failed.", " [VA scatter]");
   AddTensorAddrToCachedList addTensorAddrToCachedListFunc =
       reinterpret_cast<AddTensorAddrToCachedList>(addTensorAddrToCachedListAddr);
   if (!at_tensor.defined()) {
@@ -93,10 +99,7 @@ void scatter_add_param_to_buf(const at::Tensor& at_tensor) {
     return;
   }
   CheckNpuTensorValid(at_tensor);
-  if (at_npu::native::OpPreparation::is_scalar_wrapped_to_tensor(at_tensor)) {
-    g_hash_offset = g_hash_buf_max_size;
-    return;
-  }
+  // PTA scalar wrapping refers to CPU scalars; CheckNpuTensorValid excludes them.
   // view shape
   SCATTER_MEMCPY_TO_BUF(at_tensor.sizes().data(), static_cast<int64_t>(at_tensor.sizes().size() * sizeof(int64_t)));
   // data type
@@ -110,10 +113,10 @@ void scatter_add_param_to_buf(const at::Tensor& at_tensor) {
   auto so = at_tensor.storage_offset();
   SCATTER_MEMCPY_TO_BUF(&so, sizeof(so));
   // storage shape
-  aclDataType acl_data_type = at_npu::native::OpPreparation::convert_to_acl_data_type(st);
+  aclDataType acl_data_type = ::ConvertType(st);
   c10::SmallVector<int64_t, 5> storageDims;
   if (acl_data_type != ACL_STRING) {
-    TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.", OPS_ERROR(ErrCode::PARAM));
+    TORCH_CHECK(at_tensor.itemsize() > 0, "the itemsize of tensor must be greater than 0.", " [VA scatter]");
     storageDims.push_back(at_tensor.storage().nbytes() / at_tensor.itemsize());
   }
   SCATTER_MEMCPY_TO_BUF(storageDims.data(), static_cast<int64_t>(storageDims.size() * sizeof(int64_t)));
@@ -150,7 +153,7 @@ void scatter_add_param_to_buf(char* c) {
 
 void scatter_add_param_to_buf_v2(TensorStructPtr at_tensor) {
   static const auto addTensorAddrToCachedListAddr = GetOpApiFuncAddr("AddTensorAddrToCachedList");
-  TORCH_CHECK(addTensorAddrToCachedListAddr != nullptr, "GetOpApiFuncAddr failed.", OPS_ERROR(ErrCode::PTR));
+  TORCH_CHECK(addTensorAddrToCachedListAddr != nullptr, "GetOpApiFuncAddr failed.", " [VA scatter]");
   AddTensorAddrToCachedList addTensorAddrToCachedListFunc =
       reinterpret_cast<AddTensorAddrToCachedList>(addTensorAddrToCachedListAddr);
   if (at_tensor == nullptr) {
@@ -172,7 +175,7 @@ void scatter_add_param_to_buf_v2(TensorStructPtr at_tensor) {
   // storage shape
   c10::SmallVector<int64_t, 5> storageDims;
   if (acl_data_type != ACL_STRING) {
-    TORCH_CHECK((*at_tensor).itemsize > 0, "the itemsize of tensor must be greater than 0.", OPS_ERROR(ErrCode::PARAM));
+    TORCH_CHECK((*at_tensor).itemsize > 0, "the itemsize of tensor must be greater than 0.", " [VA scatter]");
     storageDims.push_back((*at_tensor).nbytes / (*at_tensor).itemsize);
   }
   SCATTER_MEMCPY_TO_BUF(storageDims.data(), static_cast<int64_t>(storageDims.size() * sizeof(int64_t)));
@@ -433,16 +436,11 @@ bool hit_cache(
   if (executor == nullptr) {
     return false;
   }
-  void* workspace_addr = nullptr;
-  at::Tensor workspace_tensor;
-  if (workspace_size != 0) {
-    workspace_tensor = at_npu::native::OpPreparation::unsafe_empty_workspace(workspace_size);
-    workspace_addr = const_cast<void*>(workspace_tensor.storage().data());
-  }
+  void* workspace_addr = GetWorkSpaceAddr(workspace_size);
   auto acl_call = [workspace_addr, workspace_size, acl_stream, executor, phrase2]() -> int {
     OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(phrase2);
     auto api_ret = opApiFunc(workspace_addr, workspace_size, executor, acl_stream);
-    NPU_CHECK_ERROR(api_ret, "call failed");
+    SCATTER_NPU_CHECK_ERROR(api_ret, "call failed");
     return api_ret;
   };
   at_npu::native::OpCommand::RunOpApiV2(aclnn_api, acl_call);
@@ -498,15 +496,10 @@ bool hit_cache_v2(
   if (executor == nullptr) {
     return false;
   }
-  void* workspace_addr = nullptr;
-  at::Tensor workspace_tensor;
-  if (workspace_size != 0) {
-    workspace_tensor = at_npu::native::OpPreparation::unsafe_empty_workspace(workspace_size, acl_stream);
-    workspace_addr = const_cast<void*>(workspace_tensor.storage().data());
-  }
+  void* workspace_addr = GetWorkSpaceAddr(workspace_size);
   OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(phrase2);
   *api_ret = opApiFunc(workspace_addr, workspace_size, executor, acl_stream);
-  NPU_CHECK_ERROR(*api_ret, "call failed");
+  SCATTER_NPU_CHECK_ERROR(*api_ret, "call failed");
   UnInitCacheThreadLocal();
   return true;
 }
@@ -533,11 +526,8 @@ bool hit_cache_v2(
         ", or ",                                                                                        \
         GetOpApiLibName(),                                                                              \
         " not found.",                                                                                  \
-        OPS_ERROR(ErrCode::PTR));                                                                       \
-    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);                                     \
-    if (c10_npu::check_enqueue_need_use(acl_stream)) {                                                  \
-      c10_npu::UseStreamResInCurrentThread(acl_stream);                                                 \
-    }                                                                                                   \
+        " [VA scatter]");                                                                       \
+    auto acl_stream = GetAclStream(); \
     SCATTER_EXEC_LOG_WITH_TASK_QUEUE(#aclnn_api, "EXEC_NPU_CMD", "1", acl_stream, __VA_ARGS__);              \
     uint64_t workspace_size = 0;                                                                        \
     uint64_t* workspace_size_addr = &workspace_size;                                                    \
@@ -555,20 +545,15 @@ bool hit_cache_v2(
     auto converted_params = ConvertTypes(__VA_ARGS__, workspace_size_addr, executor_addr);              \
     static auto getWorkspaceSizeFunc = ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);  \
     auto workspace_status = call(getWorkspaceSizeFunc, converted_params);                               \
-    NPU_CHECK_ERROR(workspace_status, "call " #aclnn_api " failed");                                    \
-    void* workspace_addr = nullptr;                                                                     \
-    at::Tensor workspace_tensor;                                                                        \
-    if (workspace_size != 0) {                                                                          \
-      workspace_tensor = at_npu::native::OpPreparation::unsafe_empty_workspace(workspace_size);         \
-      workspace_addr = const_cast<void*>(workspace_tensor.storage().data());                            \
-    }                                                                                                   \
+    SCATTER_NPU_CHECK_ERROR(workspace_status, "call " #aclnn_api " failed");                                    \
+    void* workspace_addr = GetWorkSpaceAddr(workspace_size); \
     auto acl_call = [converted_params, workspace_addr, workspace_size, acl_stream, executor]() -> int { \
       if (c10_npu::check_dequeue_need_use(acl_stream)) {                                                \
-        c10_npu::UseStreamResInCurrentThread(acl_stream);                                               \
+        InitExecSubTheadCtx(acl_stream);                                               \
       }                                                                                                 \
       OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);                                 \
       auto api_ret = opApiFunc(workspace_addr, workspace_size, executor, acl_stream);                   \
-      NPU_CHECK_ERROR(api_ret, "call " #aclnn_api " failed");                                           \
+      SCATTER_NPU_CHECK_ERROR(api_ret, "call " #aclnn_api " failed");                                           \
       ReleaseConvertTypes(converted_params);                                                            \
       ReleaseHugeMem releaseMemFunc = reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                 \
       if (releaseMemFunc) {                                                                             \
@@ -600,11 +585,8 @@ bool hit_cache_v2(
         ", or ",                                                                                                      \
         GetOpApiLibName(),                                                                                            \
         " not found.",                                                                                                \
-        OPS_ERROR(ErrCode::PTR));                                                                                     \
-    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);                                                   \
-    if (c10_npu::check_enqueue_need_use(acl_stream)) {                                                                \
-      c10_npu::UseStreamResInCurrentThread(acl_stream);                                                               \
-    }                                                                                                                 \
+        " [VA scatter]");                                                                                     \
+    auto acl_stream = GetAclStream(); \
     SCATTER_EXEC_LOG_WITH_TASK_QUEUE(#aclnn_api, "EXEC_NPU_CMD", "2", acl_stream, __VA_ARGS__);                            \
     auto copied_params = CopyTypesV2(__VA_ARGS__);                                                                    \
     uint32_t aic_num = UINT32_MAX;                                                                                    \
@@ -616,7 +598,7 @@ bool hit_cache_v2(
     auto snapshot = CaptureScatterDeterministicSnapshot();                                                          \
     auto acl_call = [copied_params, acl_stream, aic_num, aiv_num, snapshot]() -> int {                                \
       if (c10_npu::check_dequeue_need_use(acl_stream)) {                                                              \
-        c10_npu::UseStreamResInCurrentThread(acl_stream);                                                             \
+        InitExecSubTheadCtx(acl_stream);                                                             \
       }                                                                                                               \
       uint64_t workspace_size = 0;                                                                                    \
       uint64_t* workspace_size_addr = &workspace_size;                                                                \
@@ -634,16 +616,11 @@ bool hit_cache_v2(
       auto converted_params = ConvertTypesV2(copied_params, workspace_size_addr, executor_addr);                      \
       auto getWorkspaceSizeFunc = ConvertToOpApiFunc(converted_params, getWorkspaceSizeFuncAddr);                     \
       auto workspace_status = call(getWorkspaceSizeFunc, converted_params);                                           \
-      NPU_CHECK_ERROR(workspace_status, "call " #aclnn_api " failed");                                                \
-      void* workspace_addr = nullptr;                                                                                 \
-      at::Tensor workspace_tensor;                                                                                    \
-      if (workspace_size != 0) {                                                                                      \
-        workspace_tensor = at_npu::native::OpPreparation::unsafe_empty_workspace(workspace_size, acl_stream);         \
-        workspace_addr = const_cast<void*>(workspace_tensor.storage().data());                                        \
-      }                                                                                                               \
+      SCATTER_NPU_CHECK_ERROR(workspace_status, "call " #aclnn_api " failed");                                                \
+      void* workspace_addr = GetWorkSpaceAddr(workspace_size); \
       OpApiFunc opApiFunc = reinterpret_cast<OpApiFunc>(opApiFuncAddr);                                               \
       api_ret = opApiFunc(workspace_addr, workspace_size, executor, acl_stream);                                      \
-      NPU_CHECK_ERROR(api_ret, "call " #aclnn_api " failed");                                                         \
+      SCATTER_NPU_CHECK_ERROR(api_ret, "call " #aclnn_api " failed");                                                         \
       ReleaseConvertTypes(converted_params);                                                                          \
       ReleaseHugeMem releaseMemFunc = reinterpret_cast<ReleaseHugeMem>(releaseMemAddr);                               \
       if (releaseMemFunc) {                                                                                           \
@@ -660,7 +637,7 @@ bool hit_cache_v2(
 
 #define EXEC_NPU_CMD_SCATTER(aclnn_api, ...)                                                      \
   do {                                                                                    \
-    const auto task_queue_enable = c10_npu::option::OptionsManager::GetTaskQueueEnable(); \
+    const auto task_queue_enable = OpApiGetTaskQueueEnable(); \
     if (task_queue_enable == 2) {                                                         \
       EXEC_NPU_CMD_SCATTER_V2(aclnn_api, __VA_ARGS__);                                            \
     } else {                                                                              \
@@ -697,6 +674,7 @@ void scatter_pa_kv_cache_cached(
                      cache_mode_ptr, scatter_mode_ptr, strides, offsets);
 }
 
+#undef SCATTER_NPU_CHECK_ERROR
 #undef SCATTER_EXEC_LOG_WITH_TASK_QUEUE
 #undef SCATTER_MEMCPY_TO_BUF
 #undef EXEC_NPU_CMD_SCATTER

@@ -1,6 +1,7 @@
 import pytest
 import torch
 import torch_npu  # noqa: F401 - registers the NPU backend
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_ascend.utils import enable_custom_op
 
@@ -119,3 +120,34 @@ def test_scatter_rejects_cpu_input():
     slots = torch.tensor([0], device="npu", dtype=torch.int32)
     with pytest.raises(RuntimeError, match="Expected NPU tensor"):
         _scatter(key, value, cache[:, 0], cache[:, 1], slots)
+
+
+@pytest.mark.parametrize("scatter_mode", ["None", "NHSD"])
+def test_scatter_fake_tensor_preserves_cache_metadata(scatter_mode):
+    enable_custom_op()
+    with FakeTensorMode():
+        shape = (2, 2, 4, 128, 128) if scatter_mode == "NHSD" else (2, 2, 128, 4, 128)
+        cache = torch.zeros(shape, device="npu", dtype=torch.bfloat16)
+        key_cache, value_cache = cache[:, 0], cache[:, 1]
+        key = torch.ones((1, 4, 128), device="npu", dtype=cache.dtype)
+        slots = torch.zeros((1,), device="npu", dtype=torch.int32)
+        expected_metadata = (key_cache.shape, key_cache.stride(), value_cache.storage_offset())
+        assert _scatter(key, key, key_cache, value_cache, slots, scatter_mode) is None
+        assert (key_cache.shape, key_cache.stride(), value_cache.storage_offset()) == expected_metadata
+
+
+def test_scatter_dynamo_fullgraph_trace():
+    enable_custom_op()
+    cache = torch.zeros((2, 2, 128, 4, 128), device="npu", dtype=torch.bfloat16)
+    key = torch.ones((1, 4, 128), device="npu", dtype=cache.dtype)
+    slots = torch.zeros((1,), device="npu", dtype=torch.int32)
+
+    def update(key, value, key_cache, value_cache, slots):
+        _scatter(key, value, key_cache, value_cache, slots)
+        return key_cache, value_cache
+
+    compiled = torch.compile(update, backend="eager", fullgraph=True)
+    compiled(key, -key, cache[:, 0], cache[:, 1], slots)
+    torch.npu.synchronize()
+    torch.testing.assert_close(cache[0, 0, 0].cpu(), key[0].cpu())
+    torch.testing.assert_close(cache[0, 1, 0].cpu(), -key[0].cpu())
