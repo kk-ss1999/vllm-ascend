@@ -33,6 +33,9 @@ constexpr int g_rShift33Bits = 33;
 constexpr uint64_t MIX_STEP1 = 18397679294719823053LLU;
 constexpr uint64_t MIX_STEP2 = 14181476777654086739LLU;
 using AddTensorAddrToCachedList = void (*)(void*);
+inline const char* GetOpApiLibName(void) {
+  return "libopapi.so";
+}
 
 // The snapshot functions/TLS are private in PTA post7. Capture the same level
 // and boolean, then apply it through PTA's exported API (which keeps PTA's
